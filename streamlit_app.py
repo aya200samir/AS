@@ -241,37 +241,52 @@ def retrieve_uploads(question, selected_files=None, top_k=8):
     return "\n\n".join(blocks), results
 
 
-def retrieve_scope(question, scope, selected_titles=None, selected_files=None, top_k=8):
-    system_context, system_evidence = "", pd.DataFrame()
-    upload_context, upload_evidence = "", pd.DataFrame()
-    if scope in {"System Library", "Combined Workspace"}:
-        system_context, system_evidence = retrieve_system(question, selected_titles, top_k)
-    if scope in {"My Uploaded Files", "Combined Workspace"}:
-        upload_context, upload_evidence = retrieve_uploads(question, selected_files, top_k)
-    context = "\n\n".join(part for part in [system_context, upload_context] if part)
-    return context, system_evidence, upload_evidence
+# Always search both sources
+scope = "Combined Workspace"
+    """
+    Always retrieve from BOTH:
+      1. System Library
+      2. Uploaded Workspace (if available)
 
+    No user scope selection is required.
+    """
 
-def ask_llm(system_prompt, user_message, temperature=0.1, json_mode=False):
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ],
-        "temperature": temperature,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    response = requests.post(
-        "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=120,
+    # -----------------------------
+    # Retrieve from System Library
+    # -----------------------------
+    system_context, system_evidence = retrieve_system(
+        question,
+        selected_titles,
+        top_k,
     )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
 
+    # -----------------------------
+    # Retrieve from Uploaded Files
+    # -----------------------------
+    upload_context, upload_evidence = retrieve_uploads(
+        question,
+        selected_files,
+        top_k,
+    )
+
+    # -----------------------------
+    # Merge Context
+    # -----------------------------
+    contexts = []
+
+    if system_context.strip():
+        contexts.append(system_context)
+
+    if upload_context.strip():
+        contexts.append(upload_context)
+
+    final_context = "\n\n".join(contexts)
+
+    return (
+        final_context,
+        system_evidence,
+        upload_evidence,
+    )
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def build_retrieval_queries(question, max_queries=5):
