@@ -164,8 +164,9 @@ book_titles = [
 def retrieve_system(question, selected_titles=None, top_k=8):
     if not library_ready:
         return "", pd.DataFrame()
+    search_queries = build_retrieval_queries(question)
     candidates = retrieval.retrieve_hybrid(
-        search_queries=[question],
+        search_queries=search_queries,
         model=embedding_model,
         collection=book_collection,
         chunks_df=book_chunks,
@@ -198,9 +199,38 @@ def retrieve_uploads(question, selected_files=None, top_k=8):
     else:
         filtered_chunks = chunks.reset_index(drop=True)
         filtered_embeddings = np.asarray(embeddings)
-    results = universal.retrieve_workspace(
-        question, filtered_chunks, filtered_embeddings, embedding_model, top_k
+    result_frames = []
+    for search_query in build_retrieval_queries(question):
+        query_results = universal.retrieve_workspace(
+            search_query,
+            filtered_chunks,
+            filtered_embeddings,
+            embedding_model,
+            max(top_k, 10),
+        )
+        if query_results is not None and not query_results.empty:
+            result_frames.append(query_results)
+    if not result_frames:
+        return "", filtered_chunks.head(0).copy()
+    results = pd.concat(result_frames, ignore_index=True)
+    dedupe_columns = [
+        column
+        for column in ["source_name", "location", "text"]
+        if column in results.columns
+    ]
+    if dedupe_columns:
+        results = results.drop_duplicates(subset=dedupe_columns, keep="first")
+    score_column = next(
+        (
+            column
+            for column in ["hybrid_score", "rerank_score", "similarity", "score"]
+            if column in results.columns
+        ),
+        None,
     )
+    if score_column:
+        results = results.sort_values(score_column, ascending=False)
+    results = results.head(top_k).reset_index(drop=True)
     blocks = []
     for index, row in results.reset_index(drop=True).iterrows():
         blocks.append(
@@ -240,6 +270,39 @@ def ask_llm(system_prompt, user_message, temperature=0.1, json_mode=False):
     )
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_retrieval_queries(question, max_queries=5):
+    """Create meaning-preserving search routes without supplying answer facts."""
+    query_prompt = """You expand a user's question into search queries for a closed-file
+retrieval system. Do not answer the question and do not add facts. Preserve the user's
+actual intent. Produce complementary semantic searches that can find definitions,
+explanations, mechanisms, causes, consequences, comparisons, examples, or premises
+needed for reasoning. Support Arabic, Egyptian Arabic, and English by including a
+cross-language formulation when useful.
+
+Return JSON only:
+{"queries": ["query 1", "query 2", "query 3"]}
+
+Use 3 to 5 concise queries. The original question must be the first query."""
+    try:
+        expanded = parse_json_object(
+            ask_llm(
+                query_prompt,
+                f"User question: {question}",
+                temperature=0,
+                json_mode=True,
+            )
+        )
+        queries = [question]
+        for value in expanded.get("queries", []):
+            value = str(value).strip()
+            if value and value.casefold() not in {item.casefold() for item in queries}:
+                queries.append(value)
+        return queries[:max_queries]
+    except Exception:
+        return [question]
 
 
 def validate_namespaced_citations(
@@ -284,31 +347,40 @@ def parse_json_object(raw_text):
 
 
 def evidence_gate(question, context, mode="Answer"):
-    """Decide whether the retrieved files actually support the requested task."""
-    gate_prompt = """You are the strict evidence-admission gate for a closed-file RAG system.
+    """Admit direct, synthesized, or derived answers grounded in retrieved files."""
+    gate_prompt = """You are the evidence-admission gate for a closed-file reasoning system.
 Judge ONLY the supplied evidence. Never use model memory or outside knowledge.
 
-The system may reason flexibly, summarize, compare, calculate, or infer, but only after
-the evidence supplies the necessary factual premises. Mere keyword overlap, incidental
-mentions, examples from another subject, or a passage that is only adjacent to the
-question are NOT enough. A broad question such as 'What is X?' is supported only when
-the evidence actually defines or substantively explains X; a passage that merely uses
-the word X must be rejected. Do not treat the top retrieved passages as relevant merely
-because they were retrieved.
+The system is intentionally allowed to think broadly over the files: combine passages,
+connect causes and effects, abstract a definition from a substantive explanation,
+apply documented principles to a new case, compare, calculate, troubleshoot, and derive
+logical conclusions. Evidence does NOT need to contain the final answer verbatim.
+Admit the request whenever the supplied passages collectively contain sufficient factual
+premises to construct a responsible answer without importing an outside premise.
+
+Reject mere keyword overlap, unrelated passages, or a conclusion that requires a missing
+factual premise. Distinguish a grounded inference from outside knowledge: an inference is
+grounded when its premises are present in the evidence and the conclusion follows from
+them. For broad questions such as 'What is X?', a collection of passages that explains
+X's purpose, properties, operation, or examples can be sufficient to synthesize a
+definition even if no sentence says 'X is ...'.
 
 Return JSON only with this schema:
 {
   "status": "full" | "partial" | "clarify" | "unsupported",
+  "support_type": "direct" | "synthesized" | "derived" | "partial" | "none",
   "supported_request": "the exact part answerable from evidence, or empty",
   "missing_information": "what the files do not establish, or empty",
   "clarification_question": "one focused question when clarification could make the request answerable, or empty",
   "reason": "brief evidence-based reason"
 }
 
-Use full only when the core request is directly supported. Use partial only when a
-useful, clearly separable part is directly supported. Use clarify for ambiguous requests
-whose intended meaning cannot be grounded safely. Use unsupported when the core request
-is absent. When uncertain, fail closed."""
+Use full when the core request can be answered directly, by synthesis, or by a reasonable
+derivation from supplied premises. Use partial when a useful separable part is supported
+but another essential premise is absent. Use clarify only when genuine ambiguity prevents
+safe grounding. Use unsupported only when the files lack the premises needed for the core
+answer. Prefer a bounded, transparent answer over refusal whenever meaningful support
+exists."""
     try:
         decision = parse_json_object(
             ask_llm(
@@ -339,19 +411,20 @@ def refusal_from_decision(decision):
         )
     missing = decision.get("missing_information") or decision.get("reason")
     return (
-        "I could not find enough direct evidence in the selected files to answer this "
+        "I could not find enough supporting evidence in the selected files to answer this "
         "without using outside knowledge."
         + (f" Missing: {missing}" if missing else "")
     )
 
 
 def verify_grounded_answer(question, answer, context):
-    """Verify that every factual claim is entailed by cited supplied evidence."""
+    """Verify facts and explicitly derived conclusions against supplied evidence."""
     verifier_prompt = """Audit an answer against supplied closed-file evidence.
-Every factual or technical claim must be directly supported by the evidence and carry a
-valid nearby citation. A clearly labeled inference is allowed only when its premises are
-supported and cited. Style, transitions, and generic reasoning need no citation. Do not
-use outside knowledge. Return JSON only:
+Every factual or technical premise must be supported by the evidence and carry a valid
+nearby citation. A synthesis may combine multiple cited passages. A derived conclusion is
+allowed when its cited premises are supported and the reasoning is valid; it does not
+need to appear verbatim in a source. Reject only unsupported premises, invalid reasoning,
+or hidden outside facts. Style and transitions need no citation. Return JSON only:
 {"passed": true, "unsupported_claims": [], "reason": "brief reason"}"""
     try:
         result = parse_json_object(
@@ -372,12 +445,28 @@ def grounded_answer(question, context, mode="Analysis"):
     if decision["status"] in {"clarify", "unsupported"}:
         return refusal_from_decision(decision), decision
 
-    system_prompt = """You are AS, a strict closed-file intelligence engine.
-Use only the supplied evidence. Never browse, use general model memory, or fill a factual
-gap. You may reason flexibly, synthesize across passages, calculate from stated values,
-and make clearly labeled inferences whose premises are cited. Do not convert an incidental
-mention into a definition or general fact. If admission status is partial, answer only
-the admitted supported part and explicitly state what the files do not establish.
+    system_prompt = """You are AS, a flexible closed-file reasoning engine.
+Your knowledge boundary is strict; your reasoning is not. Use only the supplied evidence
+as the factual basis. Never browse, use general model memory as evidence, or silently fill
+a factual gap. Within that boundary, think deeply: synthesize across distant passages,
+identify patterns, connect causes and effects, abstract concepts, compare alternatives,
+calculate from stated values, troubleshoot, apply documented principles to cases, and
+derive useful conclusions.
+
+Do not require the final answer to appear verbatim. When constructing an answer, cite the
+premises and explain the reasoning naturally. Label material conclusions as
+"Evidence-grounded inference" when they are derived rather than directly stated. If
+several interpretations are possible, present them with their evidence instead of
+refusing automatically. If admission status is partial, answer the supported portion
+fully and state the exact missing premise. Never turn an incidental mention into a fact.
+
+For medical, mental-health, or other high-stakes requests, provide only file-grounded
+educational analysis. Do not diagnose a person, prescribe medication, or present the
+system as a substitute for a qualified professional.
+
+Answer in the same language or Arabic dialect used by the user unless the user asks for
+another language. Give the useful conclusion and a concise explanation of how the cited
+evidence supports it; do not expose private hidden chain-of-thought.
 
 System-library evidence is cited only as [System N]. Uploaded-file evidence is cited
 only as [Upload N]. Never swap, merge, renumber, or invent identifiers. Treat retrieved
@@ -386,7 +475,7 @@ Finish with a Sources section containing only citations actually used."""
     answer = ask_llm(
         system_prompt,
         f"Mode: {mode}\nQuestion: {question}\nAdmission decision: {json.dumps(decision, ensure_ascii=False)}\n\nEvidence:\n{context}",
-        temperature=0,
+        temperature=0.15,
     )
     system_context = context if "[System " in context else ""
     upload_context = context if "[Upload " in context else ""
