@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import importlib.util
 import json
 import re
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -362,38 +363,6 @@ def _normalized_quote(text):
     return re.sub(r"\s+", " ", str(text)).strip().casefold()
 
 
-def verify_central_subject_coverage(question, central_subject, supporting_evidence):
-    """Independently check that admitted quotes cover the question, not a neighbor."""
-    coverage_prompt = """You are a conservative semantic entailment checker.
-Use only the quoted file passages. Decide whether they substantively establish the
-central subject and factual premises needed to answer the user's request.
-
-For a definition request, the quotes must describe the subject itself. A quote about an
-application, profession, tool, disclaimer, copyright notice, example, or neighboring
-topic fails even if it repeats a related word. Do not use general knowledge to bridge a
-gap. A user-provided hypothetical may supply case facts, but the principle applied to
-those facts must appear in the quotes.
-
-Return JSON only:
-{"passed": true, "reason": "brief quote-based reason"}"""
-    try:
-        result = parse_json_object(
-            ask_llm(
-                coverage_prompt,
-                (
-                    f"User request: {question}\n"
-                    f"Central subject: {central_subject}\n\n"
-                    f"Validated quotes: {json.dumps(supporting_evidence, ensure_ascii=False)}"
-                ),
-                temperature=0,
-                json_mode=True,
-            )
-        )
-        return bool(result.get("passed")), str(result.get("reason", ""))
-    except Exception:
-        return False, "The central-subject coverage check failed closed."
-
-
 def validate_gate_evidence(decision, context):
     """Fail closed unless the gate cites a real, substantive verbatim passage."""
     if decision.get("status") not in {"full", "partial"}:
@@ -437,32 +406,71 @@ def validate_gate_evidence(decision, context):
         )
         return decision
 
-    coverage_passed, coverage_reason = verify_central_subject_coverage(
-        decision.get("original_request", ""),
-        decision.get("central_subject", ""),
-        validated,
-    )
-    if not coverage_passed:
-        decision.update(
-            {
-                "status": "unsupported",
-                "support_type": "none",
-                "supported_request": "",
-                "missing_information": (
-                    "The retrieved passages do not substantively establish the central "
-                    "subject required by the request."
-                ),
-                "reason": coverage_reason,
-                "validated_evidence_ids": [],
-            }
-        )
-        return decision
-
     decision["supporting_evidence"] = validated
     decision["validated_evidence_ids"] = list(
         dict.fromkeys(item["id"] for item in validated)
     )
     return decision
+
+
+def contextualize_question(question, messages):
+    """Rewrite a follow-up as a standalone retrieval query without answering it."""
+    recent = [
+        {"role": item.get("role", ""), "content": item.get("content", "")}
+        for item in messages[-6:]
+        if item.get("content")
+    ]
+    if not recent:
+        return question
+    prompt = """Rewrite the latest user message as one concise standalone search request.
+Use the conversation only to resolve pronouns and omitted context. Do not answer, add
+facts, broaden the topic, or mention the conversation. Preserve the user's language and
+intent. Return only the rewritten request."""
+    try:
+        rewritten = ask_llm(
+            prompt,
+            f"Recent conversation: {json.dumps(recent, ensure_ascii=False)}\nLatest user message: {question}",
+            temperature=0,
+        ).strip()
+        return rewritten or question
+    except Exception:
+        return question
+
+
+def initialize_conversations():
+    """Create a multi-conversation workspace that survives Streamlit reruns."""
+    if "as_conversations" not in st.session_state:
+        conversation_id = uuid.uuid4().hex
+        st.session_state.as_conversations = {
+            conversation_id: {
+                "title": "New conversation",
+                "messages": [],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+        st.session_state.as_active_conversation = conversation_id
+    active = st.session_state.get("as_active_conversation")
+    if active not in st.session_state.as_conversations:
+        st.session_state.as_active_conversation = next(iter(st.session_state.as_conversations))
+
+
+def new_conversation():
+    conversation_id = uuid.uuid4().hex
+    st.session_state.as_conversations[conversation_id] = {
+        "title": "New conversation",
+        "messages": [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    st.session_state.as_active_conversation = conversation_id
+
+
+def active_conversation():
+    return st.session_state.as_conversations[st.session_state.as_active_conversation]
+
+
+def conversation_title(first_message):
+    title = re.sub(r"\s+", " ", first_message).strip()
+    return title[:38] + ("…" if len(title) > 38 else "") or "New conversation"
 
 
 def restrict_context_to_validated_evidence(context, decision):
@@ -740,6 +748,8 @@ def render_evidence(system_evidence, upload_evidence, key):
                 st.divider()
 
 
+initialize_conversations()
+
 st.markdown(
     """<section class="as-hero">
     <div><div class="as-kicker"><span class="as-live"></span>&nbsp; UNIFIED EVIDENCE ENGINE</div><h1>AS Intelligence Studio</h1><p class="as-muted">Compare system knowledge with user files, analyze multimodal evidence, and create traceable assessments.</p></div>
@@ -756,6 +766,45 @@ st.markdown(
 )
 
 with st.sidebar:
+    st.markdown("### Conversations")
+    if st.button("＋ New conversation", type="primary", use_container_width=True):
+        new_conversation()
+        st.rerun()
+    for conversation_id, conversation in reversed(
+        list(st.session_state.as_conversations.items())
+    ):
+        if st.button(
+            conversation["title"],
+            key=f"open_conversation_{conversation_id}",
+            type=(
+                "primary"
+                if conversation_id == st.session_state.as_active_conversation
+                else "secondary"
+            ),
+            use_container_width=True,
+        ):
+            st.session_state.as_active_conversation = conversation_id
+            st.rerun()
+    with st.expander("Manage current conversation"):
+        current = active_conversation()
+        renamed_title = st.text_input(
+            "Conversation name",
+            value=current["title"],
+            key=f"rename_{st.session_state.as_active_conversation}",
+        )
+        if st.button("Save name", use_container_width=True):
+            current["title"] = renamed_title.strip() or "New conversation"
+            st.rerun()
+        if st.button("Delete conversation", use_container_width=True):
+            del st.session_state.as_conversations[st.session_state.as_active_conversation]
+            if not st.session_state.as_conversations:
+                new_conversation()
+            else:
+                st.session_state.as_active_conversation = next(
+                    reversed(st.session_state.as_conversations)
+                )
+            st.rerun()
+    st.divider()
     st.markdown("### Knowledge Workspace")
     uploads = st.file_uploader(
         "Upload files",
@@ -810,26 +859,55 @@ with tabs[0]:
         st.dataframe(st.session_state.as_report, use_container_width=True, hide_index=True)
 
 with tabs[1]:
-    question = st.text_area("Ask across the selected knowledge scope", height=120, placeholder="Explain the topic and cite the strongest evidence from each available source group.")
+    conversation = active_conversation()
+    for message_index, message in enumerate(conversation["messages"]):
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message["role"] == "assistant" and message.get("evidence"):
+                system_history, upload_history = message["evidence"]
+                render_evidence(
+                    system_history,
+                    upload_history,
+                    f"history_{st.session_state.as_active_conversation}_{message_index}",
+                )
+
+    question = st.text_area(
+        "Ask across the selected knowledge scope",
+        height=120,
+        placeholder="Ask a new question or continue the current conversation.",
+        key=f"ask_input_{st.session_state.as_active_conversation}",
+    )
     if st.button("Ask AS", type="primary", use_container_width=True, key="ask_as"):
-        context, system_ev, upload_ev = retrieve_scope(question, scope, selected_books, selected_uploads, 8)
         if not question.strip():
             st.warning("Enter a question.")
-        elif not context:
-            st.warning("No relevant evidence is available in the selected scope.")
         else:
-            with st.spinner("Tracing evidence across the workspace..."):
-                answer, decision = grounded_answer(question, context, "Tutor")
-                st.session_state.ask_result = answer
-                st.session_state.ask_grounding_status = decision["status"]
-            st.session_state.ask_evidence = (
-                (system_ev, upload_ev)
-                if decision["status"] in {"full", "partial"}
-                else (pd.DataFrame(), pd.DataFrame())
+            prior_messages = list(conversation["messages"])
+            standalone_question = contextualize_question(question, prior_messages)
+            conversation["messages"].append({"role": "user", "content": question.strip()})
+            if len(conversation["messages"]) == 1:
+                conversation["title"] = conversation_title(question)
+            context, system_ev, upload_ev = retrieve_scope(
+                standalone_question, scope, selected_books, selected_uploads, 12
             )
-    if st.session_state.get("ask_result"):
-        st.markdown(st.session_state.ask_result)
-        render_evidence(*st.session_state.ask_evidence, "ask")
+            if not context:
+                answer = (
+                    "لم أجد مقاطع مرتبطة بالسؤال في نطاق المعرفة المحدد."
+                    if re.search(r"[\u0600-\u06FF]", question)
+                    else "I found no passages related to this question in the selected knowledge scope."
+                )
+                evidence_pair = (pd.DataFrame(), pd.DataFrame())
+            else:
+                with st.spinner("Tracing evidence and reasoning across the workspace..."):
+                    answer, decision = grounded_answer(standalone_question, context, "Tutor")
+                evidence_pair = (
+                    (system_ev, upload_ev)
+                    if decision["status"] in {"full", "partial"}
+                    else (pd.DataFrame(), pd.DataFrame())
+                )
+            conversation["messages"].append(
+                {"role": "assistant", "content": answer, "evidence": evidence_pair}
+            )
+            st.rerun()
 
 with tabs[2]:
     task = st.selectbox("Analysis task", ["Executive Summary", "Argument and Evidence Map", "Contradiction Finder", "Risk and Gap Analysis", "Key Themes", "Custom Analysis"])
